@@ -9,7 +9,7 @@
 #ifndef MUSICSTREAM_RPC_H
 #define MUSICSTREAM_RPC_H
 
-/* RPC service id. Arbitrary but unique; 'SSMU' = SuperSolar MUsic. */
+/* RPC service id. Arbitrary but unique; 'SSMU' = HyperSolar MUsic. */
 #define MUSICSTREAM_RPC_SID  0x53534d55
 
 /* RPC function numbers (the `fno` passed to sceSifCallRpc / seen by the server). */
@@ -28,7 +28,7 @@ typedef struct {
     int  vol;           /* SETVOL: 0..0x3fff                                      */
     int  pause;         /* PAUSE: 1 = pause, 0 = resume                           */
     int  pad0;
-    char path[256];     /* PLAY:  device path, e.g. "mass0:/supersolar.adpcm"     */
+    char path[256];     /* PLAY:  device path, e.g. "mass0:/hypersolar.adpcm"     */
     int  r_ok;          /* response: 1 = playing (opened + primed + keyed on)     */
     int  r_fd;          /* response diag: file descriptor (or negative errno)     */
     int  r_primed;      /* response diag: bytes primed into the ring              */

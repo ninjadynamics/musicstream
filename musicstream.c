@@ -1,5 +1,5 @@
 /*
- * musicstream.irx — custom IOP music streamer for SuperSolar (PS2).
+ * musicstream.irx — custom IOP music streamer for HyperSolar (PS2).
  *
  * Replaces the EE-driven streamer: the EE only sends play/stop/vol/pause over
  * SIF RPC; everything else — reading the .adpcm and feeding SPU2 — runs here on
@@ -35,7 +35,7 @@
 
 #include "musicstream_rpc.h"
 
-IRX_ID("supersolar_music", 1, 0);
+IRX_ID("hypersolar_music", 1, 0);
 
 /* ---- Ring geometry (MUST match Makefile PS2_MUSIC_CHUNK and the EE side) ---- */
 #define MUS_CHUNK_BLOCKS  2048
