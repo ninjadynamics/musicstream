@@ -4,7 +4,7 @@ A small, self-contained **PlayStation 2 IOP module** that streams stereo music t
 the SPU2 with **zero EE per-frame work** — the EE just sends `play/stop/vol/pause`
 over SIF RPC and the IOP does all the file reading and SPU feeding itself.
 
-Built for [SuperSolar](https://github.com/ninjadynamics) but engine-agnostic: any
+Built for [HyperSolar](https://github.com/ninjadynamics) but engine-agnostic: any
 EE program can load it, bind its RPC, and stream music.
 
 ## Why this exists
