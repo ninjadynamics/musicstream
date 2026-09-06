@@ -33,7 +33,7 @@ an IRQ or the RPC handler.
 ## Audio format
 
 Raw **PS-ADPCM**, 16-byte blocks, stereo, chunk-interleaved. `MUS_CHUNK_BLOCKS`
-(default 2048 = a 32 KB half per channel, ~1.2 s at 48 kHz) must match how the
+(default 1024 = a 16 KB half per channel, ~0.6 s at 48 kHz) must match how the
 file was encoded. No VAG header. 48 kHz native (pitch `0x1000`).
 
 ## RPC interface

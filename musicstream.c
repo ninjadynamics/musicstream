@@ -38,11 +38,11 @@
 IRX_ID("hypersolar_music", 1, 0);
 
 /* ---- Ring geometry (MUST match Makefile PS2_MUSIC_CHUNK and the EE side) ---- */
-#define MUS_CHUNK_BLOCKS  2048
-#define MUS_HALF_BYTES    (MUS_CHUNK_BLOCKS * 16)        /* 32 KB per channel-half */
-#define MUS_RING_BYTES    (MUS_HALF_BYTES * 2)           /* 64 KB per channel ring */
-#define MUS_L_RING        0x1A0000u
-#define MUS_R_RING        (MUS_L_RING + MUS_RING_BYTES)  /* 0x1B0000 */
+#define MUS_CHUNK_BLOCKS  1024
+#define MUS_HALF_BYTES    (MUS_CHUNK_BLOCKS * 16)        /* 16 KB per channel-half */
+#define MUS_RING_BYTES    (MUS_HALF_BYTES * 2)           /* 32 KB per channel ring */
+#define MUS_L_RING        0x1F0000u
+#define MUS_R_RING        (MUS_L_RING + MUS_RING_BYTES)  /* 0x1F8000 */
 #define MUS_VOICE_L       22
 #define MUS_VOICE_R       23
 
@@ -58,7 +58,7 @@ static int  g_vol       = 0x3fff;
 static int  g_last_half = 0;
 
 /* Async open: a PLAY command only *requests* playback (so the EE RPC returns at
-   once instead of blocking on the ~128 KB open+prime). The stream thread does the
+   once instead of blocking on the ~64 KB open+prime). The stream thread does the
    actual open in its loop and self-retries on failure (USB mount latency), so the
    EE never blocks and never has to retry. */
 static int  g_want_play  = 0;            /* should be playing g_play_path        */
