@@ -36,6 +36,14 @@ Raw **PS-ADPCM**, 16-byte blocks, stereo, chunk-interleaved. `MUS_CHUNK_BLOCKS`
 (default 1024 = a 16 KB half per channel, ~0.6 s at 48 kHz) must match how the
 file was encoded. No VAG header. 48 kHz native (pitch `0x1000`).
 
+Changing the chunk size requires regenerating and replacing external music
+files as well as rebuilding the module. Raw ADPCM has no header identifying
+the interleave. In HyperSolar's September 8, 2026 hardware test, old 2048-block
+USB files played through the 1024-block reader sent successive sections of
+one channel to opposite outputs, producing a 0.597-second offset and doubled
+vocals. Replacing the files fixed playback without a runtime audio change.
+Check the deployed data before assuming that music was started twice.
+
 ## RPC interface
 
 See [`musicstream_rpc.h`](musicstream_rpc.h) — the shared EE/IOP header (SID,
