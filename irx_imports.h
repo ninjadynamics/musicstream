@@ -10,6 +10,7 @@
 #define IRX_IMPORTS_H
 
 #include <irx.h>
+#include <intrman.h>
 
 #include <sysclib.h>   /* memcpy / memset (IOP is -nostdlib -fno-builtin) */
 #include <sifcmd.h>    /* SIF RPC server */

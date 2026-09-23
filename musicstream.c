@@ -3,21 +3,22 @@
  *
  * Replaces the EE-driven streamer: the EE only sends play/stop/vol/pause over
  * SIF RPC; everything else — reading the .adpcm and feeding SPU2 — runs here on
- * the IOP, so the EE does ZERO per-frame audio work (structurally stall-free).
+ * the IOP. The EE handles control admission, with no music decode/refill work.
  *
  * Design (see PS2/IOP_AUDIO_PLAN.md, PS2/LESSONS.md):
  *   - Stereo = two SPU2 voices (22 L, 23 R), each a 2-half ring in SPU2 RAM.
  *     The .adpcm is chunk-interleaved [L:CHUNK][R:CHUNK]; one CHUNK == one half.
- *   - A dedicated stream thread polls the play cursor (NAX) every ~8 ms and,
+ *   - A dedicated stream thread polls the play cursor (NAX) every ~4 ms and,
  *     when the cursor crosses into a new half, refills the half it just left
  *     with the next file chunk. The ring self-loops via the SPU block flags
  *     (0x06 start / 0x03 end), so playback is gapless; the file rewinds at EOF.
  *   - THE RULE that beats ps2snd: the blocking file read + SPU DMA happen ONLY
  *     on the stream thread, never inside an IRQ or the RPC handler. The RPC
- *     handler just hands a command to the stream thread and waits for the ack.
- *   - Uses the SAME libsd (sceSd*) the SFX use (voices 0-11). We never call
- *     sceSdInit — the EE already initialized SPU2 via ps2snd; we only drive
- *     our two voices.
+ *     queue handler owns a command copy before replying. The legacy handler
+ *     waits for consumption and can stall behind the worker's previous I/O.
+ *   - Uses the SAME libsd (sceSd*) the SFX use (voices 0-14). We never call
+ *     sceSdInit — the EE already initialized SPU2 via ps2snd. Music owns
+ *     voices 22/23; the optional SFX batch handles EE-authored voice writes.
  *
  * IOP note: the R3000A IOP has no write-back data cache (its D-cache is the
  * scratchpad), so CPU writes to the read buffer are visible to the SPU DMA with
@@ -32,6 +33,7 @@
 #include <loadcore.h>
 #include <libsd.h>
 #include <iomanX.h>
+#include <intrman.h>
 
 #include "musicstream_rpc.h"
 
@@ -57,10 +59,9 @@ static int  g_paused    = 0;
 static int  g_vol       = 0x3fff;
 static int  g_last_half = 0;
 
-/* Async open: a PLAY command only *requests* playback (so the EE RPC returns at
-   once instead of blocking on the ~64 KB open+prime). The stream thread does the
-   actual open in its loop and self-retries on failure (USB mount latency), so the
-   EE never blocks and never has to retry. */
+/* A consumed PLAY only requests playback. The stream thread opens/primes below
+   and retries USB mount failures. Legacy consumption can wait behind prior
+   I/O; queue admission does not wait for this worker. */
 static int  g_want_play  = 0;            /* should be playing g_play_path        */
 static int  g_play_loop  = 1;
 static int  g_open_div   = 0;            /* ticks until the next open attempt     */
@@ -70,16 +71,137 @@ static unsigned char g_buf[MUS_HALF_BYTES * 2] __attribute__((aligned(64)));  /*
 /* ---- EE command handshake (RPC thread -> stream thread) ----
    The EE RPC is synchronous (one outstanding call at a time), so a single
    command slot is race-free: the RPC handler fills g_req + g_cmd, signals, then
-   waits g_done; the stream thread picks it up on its next ~8 ms tick, processes
-   it (all file/SPU work happens HERE), writes the response, and signals g_done. */
+   waits g_done. The stream thread copies it on a later ~4 ms tick and signals
+   g_done BEFORE processing. A previous file read can delay that consumption. */
 static volatile int g_cmd = 0;          /* pending MUS_RPC_*; 0 = none */
 static MusRpc       g_req;              /* request copied out of the RPC buffer */
 static int g_sem_done = -1;            /* RPC handler waits on this for consume-ack */
 
+/* Queue-mode commands are owned here before the RPC replies. Only these
+   bounded copies/cursors are protected; file and SPU work runs after pop. */
+static MusQueuedCommand g_commands[MUS_COMMAND_QUEUE_MAX];
+static volatile unsigned int g_command_head, g_command_tail;
+static MusQueueReply g_command_reply __attribute__((aligned(64)));
+
+static int command_pop(MusQueuedCommand *command) {
+    int state;
+    if (g_command_head == g_command_tail) return 0;
+    CpuSuspendIntr(&state);
+    if (g_command_head == g_command_tail) {
+        CpuResumeIntr(state);
+        return 0;
+    }
+    *command = g_commands[g_command_tail % MUS_COMMAND_QUEUE_MAX];
+    ++g_command_tail;
+    CpuResumeIntr(state);
+    return 1;
+}
+
 /* ---- RPC server ---- */
 static SifRpcServerData_t g_server;
 static SifRpcDataQueue_t  g_queue;
-static MusRpc             g_rpc_buf __attribute__((aligned(64)));
+/* Receive buffer sized for the largest request (the SFX batch). */
+static union {
+    MusRpc     mus;
+    MusSdBatch sd;
+    MusQueuedCommand command;
+} g_rpc_buf __attribute__((aligned(64)));
+static MusSdBatchReply g_sd_reply __attribute__((aligned(64)));
+
+/* ---- Serialized SPU2 register writes ----
+   SPU2 Overview Manual (1.1; KON/KOF notes pp.53-54): a register must not be
+   written twice within 1 Ts (2 Ts for KON/KOF), and KON/KOF of one voice must
+   be 2 Ts apart (1 Ts = 1/48000 s). Every SPU register write this module
+   makes, from the RPC thread (SFX batch) or the stream thread (music voices),
+   goes through sd_write under one lock. It uses a shared log of recent writes
+   and a per-core key clock, so the spacing holds across batches, across
+   threads and across different voices sharing KON/KOF/VMIX. The spin polls the
+   system clock with interrupts enabled; it never assumes elapsed time.
+   The interval is 2 Ts (41.7 us) rounded up to 43 us, plus one clock tick for
+   quantization of the two timestamps, for every register. */
+#define MUS_SD_SPACING_USEC 43u
+#define MUS_SD_LOG 32u                           /* power of two */
+static int g_sd_lock = -1;
+static u64 g_sd_spacing_clocks;
+static u64 g_sd_keyed_at[2];                     /* last KON/KOF write per core */
+static struct {
+    u64 at;
+    unsigned short kind, entry;
+} g_sd_log[MUS_SD_LOG];                          /* newest at g_sd_log_head - 1 */
+static unsigned g_sd_log_head;
+
+static u64 sd_clock(void) {
+    iop_sys_clock_t c;
+    GetSystemTime(&c);
+    return ((u64)c.hi << 32) | c.lo;
+}
+
+static void sd_spacing_wait(u64 since) {
+    if (!since) return;
+    while (sd_clock() - since <= g_sd_spacing_clocks) {
+    }
+}
+
+/* A failed WaitSema is never ownership: the caller must not write. */
+static int sd_lock(void) { return WaitSema(g_sd_lock) >= 0; }
+static void sd_unlock(void) { SignalSema(g_sd_lock); }
+
+/* Caller holds the lock. */
+static void sd_write_locked(unsigned kind, u16 entry, u32 value) {
+    unsigned k;
+    const int is_key = kind == MUS_SD_SET_SWITCH &&
+        ((entry & 0xff00u) == SD_SWITCH_KON ||
+         (entry & 0xff00u) == SD_SWITCH_KOFF);
+    if (is_key) sd_spacing_wait(g_sd_keyed_at[entry & 1u]);
+    /* The slot this write will reuse may only be evicted once its entry has
+       expired, so the log always holds every register written within the
+       interval, however fast the writes arrive. */
+    sd_spacing_wait(g_sd_log[g_sd_log_head & (MUS_SD_LOG - 1u)].at);
+    for (k = 1; k <= MUS_SD_LOG; k++) {          /* newest first */
+        const unsigned idx = (g_sd_log_head - k) & (MUS_SD_LOG - 1u);
+        if (!g_sd_log[idx].at ||
+            sd_clock() - g_sd_log[idx].at > g_sd_spacing_clocks) break;
+        if (g_sd_log[idx].kind == kind && g_sd_log[idx].entry == entry) {
+            sd_spacing_wait(g_sd_log[idx].at);
+            break;
+        }
+    }
+    if (kind == MUS_SD_SET_PARAM)
+        sceSdSetParam(entry, (u16)value);
+    else if (kind == MUS_SD_SET_SWITCH)
+        sceSdSetSwitch(entry, value);
+    else
+        sceSdSetAddr(entry, value);
+    {
+        const u64 now = sd_clock();
+        const unsigned idx = g_sd_log_head & (MUS_SD_LOG - 1u);
+        g_sd_log[idx].at = now;
+        g_sd_log[idx].kind = (unsigned short)kind;
+        g_sd_log[idx].entry = entry;
+        g_sd_log_head++;
+        if (is_key) g_sd_keyed_at[entry & 1u] = now;
+    }
+}
+
+/* Latched once: an ownership failure is impossible after a successful
+   startup, so any dropped write is reported rather than hidden. */
+static int g_sd_lock_failed;
+
+static void sd_lock_failure(u16 entry) {
+    if (g_sd_lock_failed) return;
+    g_sd_lock_failed = 1;
+    printf("MUSIC(IOP): SPU write lock failed; write %04x dropped, "
+           "music state unreliable\n", (unsigned)entry);
+}
+
+static void sd_write(unsigned kind, u16 entry, u32 value) {
+    if (!sd_lock()) {                /* no unserialized write */
+        sd_lock_failure(entry);
+        return;
+    }
+    sd_write_locked(kind, entry, value);
+    sd_unlock();
+}
 
 /* ===================== stream-thread internals ===================== */
 
@@ -136,13 +258,14 @@ static int refill_half(int h) {
 }
 
 static void apply_volume(void) {
-    sceSdSetParam(SD_VOICE(0, MUS_VOICE_L) | SD_VPARAM_VOLL, (u16)g_vol);
-    sceSdSetParam(SD_VOICE(0, MUS_VOICE_R) | SD_VPARAM_VOLR, (u16)g_vol);
+    sd_write(MUS_SD_SET_PARAM, SD_VOICE(0, MUS_VOICE_L) | SD_VPARAM_VOLL, (u16)g_vol);
+    sd_write(MUS_SD_SET_PARAM, SD_VOICE(0, MUS_VOICE_R) | SD_VPARAM_VOLR, (u16)g_vol);
 }
 
 static void stop_playback(void) {
     if (g_playing) {
-        sceSdSetSwitch(0 | SD_SWITCH_KOFF, (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R));
+        sd_write(MUS_SD_SET_SWITCH, 0 | SD_SWITCH_KOFF,
+                 (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R));
         g_playing = 0;
     }
     if (g_fd >= 0) { iomanX_close(g_fd); g_fd = -1; }
@@ -165,32 +288,40 @@ static int start_playback(const char *path, int loop) {
     {
         int vl = SD_VOICE(0, MUS_VOICE_L);
         int vr = SD_VOICE(0, MUS_VOICE_R);
-        sceSdSetParam(vl | SD_VPARAM_ADSR1, SD_SET_ADSR1(1, 0, 0, 0xf));
-        sceSdSetParam(vl | SD_VPARAM_ADSR2, SD_SET_ADSR2(1, 0x7f, 0, 0x0e));
-        sceSdSetParam(vr | SD_VPARAM_ADSR1, SD_SET_ADSR1(1, 0, 0, 0xf));
-        sceSdSetParam(vr | SD_VPARAM_ADSR2, SD_SET_ADSR2(1, 0x7f, 0, 0x0e));
-        sceSdSetAddr(vl | SD_VADDR_SSA, MUS_L_RING);
-        sceSdSetAddr(vr | SD_VADDR_SSA, MUS_R_RING);
-        sceSdSetParam(vl | SD_VPARAM_PITCH, 0x1000);
-        sceSdSetParam(vr | SD_VPARAM_PITCH, 0x1000);
-        sceSdSetParam(vl | SD_VPARAM_VOLL, (u16)g_vol);
-        sceSdSetParam(vl | SD_VPARAM_VOLR, 0);
-        sceSdSetParam(vr | SD_VPARAM_VOLL, 0);
-        sceSdSetParam(vr | SD_VPARAM_VOLR, (u16)g_vol);
+        sd_write(MUS_SD_SET_PARAM, vl | SD_VPARAM_ADSR1, SD_SET_ADSR1(1, 0, 0, 0xf));
+        sd_write(MUS_SD_SET_PARAM, vl | SD_VPARAM_ADSR2, SD_SET_ADSR2(1, 0x7f, 0, 0x0e));
+        sd_write(MUS_SD_SET_PARAM, vr | SD_VPARAM_ADSR1, SD_SET_ADSR1(1, 0, 0, 0xf));
+        sd_write(MUS_SD_SET_PARAM, vr | SD_VPARAM_ADSR2, SD_SET_ADSR2(1, 0x7f, 0, 0x0e));
+        sd_write(MUS_SD_SET_ADDR, vl | SD_VADDR_SSA, MUS_L_RING);
+        sd_write(MUS_SD_SET_ADDR, vr | SD_VADDR_SSA, MUS_R_RING);
+        sd_write(MUS_SD_SET_PARAM, vl | SD_VPARAM_PITCH, 0x1000);
+        sd_write(MUS_SD_SET_PARAM, vr | SD_VPARAM_PITCH, 0x1000);
+        sd_write(MUS_SD_SET_PARAM, vl | SD_VPARAM_VOLL, (u16)g_vol);
+        sd_write(MUS_SD_SET_PARAM, vl | SD_VPARAM_VOLR, 0);
+        sd_write(MUS_SD_SET_PARAM, vr | SD_VPARAM_VOLL, 0);
+        sd_write(MUS_SD_SET_PARAM, vr | SD_VPARAM_VOLR, (u16)g_vol);
         /* Route the music voices into the core's dry output mix — WITHOUT this a
            keyed-on voice is generated but never summed to output (= silence; the
            refill loop still reads the file, which is why the stick blinks). The
            SFX (voices 0-11) already have their VMIX bits set by the EE/ps2snd, so
            read-modify-write to OR ours in without clearing theirs. */
         {
-            u32 vml = sceSdGetSwitch(0 | SD_SWITCH_VMIXL);
-            u32 vmr = sceSdGetSwitch(0 | SD_SWITCH_VMIXR);
-            vml |= (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R);
-            vmr |= (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R);
-            sceSdSetSwitch(0 | SD_SWITCH_VMIXL, vml);
-            sceSdSetSwitch(0 | SD_SWITCH_VMIXR, vmr);
+            /* The read-modify-write holds the lock, so no batch VMIX write
+               can land between the read and our write. */
+            if (!sd_lock()) {
+                sd_lock_failure(0 | SD_SWITCH_VMIXL);
+            } else {
+                u32 vml = sceSdGetSwitch(0 | SD_SWITCH_VMIXL);
+                u32 vmr = sceSdGetSwitch(0 | SD_SWITCH_VMIXR);
+                vml |= (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R);
+                vmr |= (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R);
+                sd_write_locked(MUS_SD_SET_SWITCH, 0 | SD_SWITCH_VMIXL, vml);
+                sd_write_locked(MUS_SD_SET_SWITCH, 0 | SD_SWITCH_VMIXR, vmr);
+                sd_unlock();
+            }
         }
-        sceSdSetSwitch(0 | SD_SWITCH_KON, (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R));
+        sd_write(MUS_SD_SET_SWITCH, 0 | SD_SWITCH_KON,
+                 (1u << MUS_VOICE_L) | (1u << MUS_VOICE_R));
     }
     g_playing = 1;
     printf("MUSIC(IOP): playing '%s' (loop=%d primed=%d)\n", path, g_loop, primed);
@@ -233,8 +364,8 @@ static void process_cmd(int cmd, const MusRpc *req) {
         g_paused = req->pause ? 1 : 0;
         if (g_playing) {
             u16 p = g_paused ? 0 : 0x1000;   /* pitch 0 freezes playback */
-            sceSdSetParam(SD_VOICE(0, MUS_VOICE_L) | SD_VPARAM_PITCH, p);
-            sceSdSetParam(SD_VOICE(0, MUS_VOICE_R) | SD_VPARAM_PITCH, p);
+            sd_write(MUS_SD_SET_PARAM, SD_VOICE(0, MUS_VOICE_L) | SD_VPARAM_PITCH, p);
+            sd_write(MUS_SD_SET_PARAM, SD_VOICE(0, MUS_VOICE_R) | SD_VPARAM_PITCH, p);
         }
         break;
     default:
@@ -253,12 +384,21 @@ static void stream_thread(void *arg) {
             /* Copy the request to a local BEFORE acking: once we SignalSema the
                EE is free to issue the next command and overwrite g_req. The heavy
                work (open/prime) then happens here, AFTER the ack, so the EE's RPC
-               returned within ~one tick instead of blocking on the open. */
+               need not wait for this command's open. Previous I/O can still
+               delay reaching this consume point in the legacy path. */
             int   cmd = g_cmd;
             MusRpc req = g_req;
             g_cmd = 0;
             SignalSema(g_sem_done);
             process_cmd(cmd, &req);
+        }
+
+        /* Match the old one-command-per-tick processing order: a PLAY still
+           reaches open/prime below before the next queued command is taken. */
+        {
+            MusQueuedCommand command;
+            if (command_pop(&command))
+                process_cmd(command.command, &command.request);
         }
 
         /* Async open + self-retry (USB mount latency): try now, else wait ~1 s. */
@@ -278,12 +418,69 @@ static void stream_thread(void *arg) {
 
 /* ===================== RPC server thread ===================== */
 
-/* Runs on the RPC thread. Hands the command to the stream thread and waits only
-   until it is CONSUMED (not until the open completes) — so the EE RPC returns
-   within ~one tick, never blocking on file/SPU work (which also keeps that work
-   off the RPC thread, avoiding the ps2snd-style deadlock). The EE is optimistic
-   (treats playback as started); the IOP self-retries the open. */
+/* Queue admission replies after an owned copy. Legacy control RPCs wait for
+   stream consumption, which may be behind a previous file read/refill. Neither
+   acknowledgement establishes command application or successful file open. */
 static void *rpc_handler(int fno, void *buffer, int length) {
+    if (fno == MUS_RPC_COMMAND_QUEUE) {
+        const MusQueuedCommand *command = (const MusQueuedCommand *)buffer;
+        int state;
+        int valid = length == (int)sizeof(*command);
+        if (valid)
+            valid = command->command >= MUS_RPC_PLAY &&
+                    command->command <= MUS_RPC_PAUSE;
+        g_command_reply.magic = MUS_QUEUE_REPLY_MAGIC;
+        g_command_reply.sequence = length == (int)sizeof(*command) ? command->sequence : 0;
+        g_command_reply.status = MUS_QUEUE_REJECTED;
+        CpuSuspendIntr(&state);
+        if (valid) {
+            if (g_command_head - g_command_tail == MUS_COMMAND_QUEUE_MAX) {
+                g_command_reply.status = MUS_QUEUE_FULL;
+            } else {
+                g_commands[g_command_head % MUS_COMMAND_QUEUE_MAX] = *command;
+                ++g_command_head;          /* publish only after the owned copy */
+                g_command_reply.status = MUS_QUEUE_OK;
+            }
+        }
+        g_command_reply.depth = g_command_head - g_command_tail;
+        CpuResumeIntr(state);
+        return &g_command_reply;
+    }
+    if (fno == MUS_RPC_SD_BATCH) {
+        /* SFX register writes only: apply in EE order right here, like
+           ps2snd's own server does per call. No file/transfer work and no
+           stream-thread handshake, so the EE waits for one round trip.
+           Validate the whole packet first: all ops or none. */
+        const MusSdBatch *b = (const MusSdBatch *)buffer;
+        const int n = b->count;
+        int i;
+        int ok = n >= 1 && n <= MUS_SD_BATCH_MAX &&
+                 length >= 16 + n * (int)sizeof(MusSdOp);
+        for (i = 0; ok && i < n; i++) {
+            const unsigned short kind = b->op[i].kind;
+            ok = kind == MUS_SD_SET_PARAM || kind == MUS_SD_SET_SWITCH ||
+                 kind == MUS_SD_SET_ADDR;
+        }
+        g_sd_reply.status = ok ? MUS_SD_BATCH_OK : MUS_SD_BATCH_REJECTED;
+        g_sd_reply.applied = 0;
+        /* One lock for the batch keeps its writes contiguous; sd_write's
+           clock/log enforce the SPU2 spacing between any two of them. A lock
+           failure applies nothing and reports REJECTED, so the EE replays. */
+        if (ok && !sd_lock()) {
+            sd_lock_failure(b->op[0].entry);
+            ok = 0;
+            g_sd_reply.status = MUS_SD_BATCH_REJECTED;
+        }
+        if (ok) {
+            for (i = 0; i < n; i++) {
+                const MusSdOp *op = &b->op[i];
+                sd_write_locked(op->kind, op->entry, op->value);
+                g_sd_reply.applied = i + 1;
+            }
+            sd_unlock();
+        }
+        return &g_sd_reply;
+    }
     MusRpc *m = (MusRpc *)buffer;
     (void)length;
     g_req = *m;                            /* copy request out (full write first) */
@@ -310,6 +507,21 @@ int _start(int argc, char *argv[]) {
 
     sm.attr = 0; sm.option = 0; sm.initial = 0; sm.max = 1;
     g_sem_done = CreateSema(&sm);
+    /* The SPU write lock is a synchronization boundary: without it no RPC
+       server may be advertised. Created taken (initial 0), then released. */
+    g_sd_lock = CreateSema(&sm);
+    if (g_sd_lock < 0 || SignalSema(g_sd_lock) < 0) {
+        printf("MUSIC(IOP): SPU write lock unavailable (%d); not loading\n",
+               g_sd_lock);
+        if (g_sd_lock >= 0) DeleteSema(g_sd_lock);
+        if (g_sem_done >= 0) DeleteSema(g_sem_done);
+        return MODULE_NO_RESIDENT_END;
+    }
+    {
+        iop_sys_clock_t spacing;
+        USec2SysClock(MUS_SD_SPACING_USEC, &spacing);
+        g_sd_spacing_clocks = (((u64)spacing.hi << 32) | spacing.lo) + 1u;
+    }
 
     /* Stream thread: lower priority so its blocking reads yield to the USB/cdvd
        driver threads. C linkage, modest stack. */
